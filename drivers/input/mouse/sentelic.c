@@ -21,6 +21,7 @@
 
 #include <linux/module.h>
 #include <linux/input.h>
+#include <linux/input/mt.h>
 #include <linux/ctype.h>
 #include <linux/libps2.h>
 #include <linux/serio.h>
@@ -37,7 +38,7 @@
 #define	FSP_CMD_TIMEOUT2	30
 
 /** Driver version. */
-static const char fsp_drv_ver[] = "1.0.0-K";
+static const char fsp_drv_ver[] = "1.0.0-K-OS1";
 
 /*
  * Make sure that the value being sent to FSP will not conflict with
@@ -620,26 +621,44 @@ static struct attribute_group fsp_attribute_group = {
 };
 
 #ifdef FSP_DEBUG
-static void fsp_packet_debug(unsigned char packet[])
+static void fsp_packet_debug(struct psmouse *psmouse, unsigned char packet[])
 {
 	static unsigned int ps2_packet_cnt;
 	static unsigned int ps2_last_second;
 	unsigned int jiffies_msec;
+	const char *packet_type = "UNKNOWN";
+
+	/* Interpret & dump the packet data. */
+	switch (psmouse->packet[0] >> FSP_PKT_TYPE_SHIFT) {
+	case FSP_PKT_TYPE_ABS:
+		packet_type = "Absolute";
+		break;
+	case FSP_PKT_TYPE_NORMAL:
+		packet_type = "Normal";
+		break;
+	case FSP_PKT_TYPE_NOTIFY:
+		packet_type = "Notify";
+		break;
+	case FSP_PKT_TYPE_NORMAL_OPC:
+		packet_type = "Normal-OPC";
+		break;
+	}
 
 	ps2_packet_cnt++;
 	jiffies_msec = jiffies_to_msecs(jiffies);
-	psmouse_dbg(psmouse,
-		    "%08dms PS/2 packets: %02x, %02x, %02x, %02x\n",
-		    jiffies_msec, packet[0], packet[1], packet[2], packet[3]);
-
+	psmouse_info(psmouse,
+		    "%08dms %s packet: %02x, %02x, %02x, %02x\n",
+		    jiffies_msec, packet_type,
+		    packet[0], packet[1], packet[2], packet[3]);
 	if (jiffies_msec - ps2_last_second > 1000) {
-		psmouse_dbg(psmouse, "PS/2 packets/sec = %d\n", ps2_packet_cnt);
+		psmouse_info(psmouse, "PS/2 packets/sec = %d\n",
+			     ps2_packet_cnt);
 		ps2_packet_cnt = 0;
 		ps2_last_second = jiffies_msec;
 	}
 }
 #else
-static void fsp_packet_debug(unsigned char packet[])
+static void fsp_packet_debug(struct psmouse *psmouse, unsigned char packet[])
 {
 }
 #endif
@@ -649,8 +668,11 @@ static psmouse_ret_t fsp_process_byte(struct psmouse *psmouse)
 	struct input_dev *dev = psmouse->dev;
 	struct fsp_data *ad = psmouse->private;
 	unsigned char *packet = psmouse->packet;
-	unsigned char button_status = 0, lscroll = 0, rscroll = 0;
+	unsigned short abs_x, abs_y, fingers = 0;
+	unsigned short vscroll = 0, hscroll = 0, lscroll = 0, rscroll = 0;
+	unsigned short lbutton, rbutton, mbutton;
 	int rel_x, rel_y;
+	static bool r_down, lifted;
 
 	if (psmouse->pktcnt < 4)
 		return PSMOUSE_GOOD_DATA;
@@ -660,9 +682,103 @@ static psmouse_ret_t fsp_process_byte(struct psmouse *psmouse)
 	 */
 
 	switch (psmouse->packet[0] >> FSP_PKT_TYPE_SHIFT) {
+	case FSP_PKT_TYPE_NOTIFY:
+		/* Notify packets are sent with Cx touchpads if
+		 * register 0x90 bit 0x02 is set:
+		 * vscroll up: 0x86, down: 0x82
+		 * hscroll left: 0x84, right: 0x80
+		 */
+		switch (packet[2]) {
+		case 0x86:
+			vscroll =  1;
+			break;
+		case 0x82:
+			vscroll = -1;
+			break;
+		case 0x84:
+			hscroll =  1;
+			break;
+		case 0x80:
+			hscroll = -1;
+			break;
+		}
+		input_report_rel(dev, REL_WHEEL, vscroll);
+		input_report_rel(dev, REL_HWHEEL, hscroll);
+		break;
+
 	case FSP_PKT_TYPE_ABS:
-		dev_warn(&psmouse->ps2dev.serio->dev,
-			 "Unexpected absolute mode packet, ignored.\n");
+		/* Absolute packets are sent with version Cx and newer
+		 * touchpads if register 0x90 bit 0x01 is set
+		 */
+		abs_x = (packet[1] << 2) | ((packet[3] >> 2) & 0x03);
+		abs_y = (packet[2] << 2) | (packet[3] & 0x03);
+
+		lbutton = packet[0] & BIT(0);
+		rbutton = packet[0] & BIT(1);
+		mbutton = packet[0] & BIT(2);
+
+		if (packet[1] || packet[2] || packet[3]) {
+			/* at least one finger is down */
+			fingers++;
+			lifted = false;
+		} else {
+			if (lifted == false) {
+				lifted = true;
+				return PSMOUSE_FULL_PACKET;
+			}
+		}
+
+		if (packet[0] & BIT(5)) {
+			/* multitouch mode: two fingers down */
+			fingers++;
+			if ((packet[0] & BIT(4)) == 0 && lbutton && rbutton) {
+				/* middle-click in multitouch mode */
+				lbutton = 0;
+				rbutton = 0;
+				mbutton = 1;
+			}
+			if (packet[0] & BIT(2)) {
+				/* right finger down, save state */
+				r_down = true;
+				return PSMOUSE_FULL_PACKET;
+			}
+			if (r_down == false) {
+				/* left finger down, right finger not */
+				return PSMOUSE_FULL_PACKET;
+			}
+		} else if (fingers == 0) {
+			r_down = false;
+		}
+
+		if ((packet[0] & BIT(4)) == 0 && lbutton) {
+			/* on pad click */
+			lbutton = (ad->flags & FSPDRV_FLAG_EN_OPC) ==
+						FSPDRV_FLAG_EN_OPC;
+		}
+
+		input_report_key(dev, BTN_TOUCH, fingers > 0);
+		input_report_abs(dev, ABS_X, abs_x);
+		input_report_abs(dev, ABS_Y, abs_y);
+
+		input_mt_slot(dev, 0);
+		input_mt_report_slot_state(dev, MT_TOOL_FINGER, fingers >= 1);
+		if (fingers >= 1) {
+			input_report_abs(dev, ABS_MT_POSITION_X, abs_x);
+			input_report_abs(dev, ABS_MT_POSITION_Y, abs_y);
+		}
+
+		input_mt_slot(dev, 1);
+		input_mt_report_slot_state(dev, MT_TOOL_FINGER, fingers >= 2);
+		if (fingers >= 2) {
+			input_report_abs(dev, ABS_MT_POSITION_X, abs_x);
+			input_report_abs(dev, ABS_MT_POSITION_Y, abs_y);
+		}
+
+		input_report_key(dev, BTN_TOOL_FINGER, fingers == 1);
+		input_report_key(dev, BTN_TOOL_DOUBLETAP, fingers == 2);
+		input_report_key(dev, BTN_LEFT, lbutton);
+		input_report_key(dev, BTN_MIDDLE, mbutton);
+		input_report_key(dev, BTN_RIGHT, rbutton);
 		break;
 
 	case FSP_PKT_TYPE_NORMAL_OPC:
@@ -675,6 +791,7 @@ static psmouse_ret_t fsp_process_byte(struct psmouse *psmouse)
 		/* normal packet */
 		/* special packet data translation from on-pad packets */
 		if (packet[3] != 0) {
+			unsigned char button_status = 0;
 			if (packet[3] & BIT(0))
 				button_status |= 0x01;	/* wheel down */
 			if (packet[3] & BIT(1))
@@ -715,7 +832,7 @@ static psmouse_ret_t fsp_process_byte(struct psmouse *psmouse)
 
 	input_sync(dev);
 
-	fsp_packet_debug(packet);
+	fsp_packet_debug(psmouse, packet);
 
 	return PSMOUSE_FULL_PACKET;
 }
@@ -754,6 +871,7 @@ static int fsp_activate_protocol(struct psmouse *psmouse)
 	val &= ~(FSP_BIT_EN_MSID7 | FSP_BIT_EN_MSID8 | FSP_BIT_EN_AUTO_MSID8);
 	/* Ensure we are not in absolute mode */
 	val &= ~FSP_BIT_EN_PKT_G0;
+
 	if (pad->buttons == 0x06) {
 		/* Left/Middle/Right & Scroll Up/Down/Right/Left */
 		val |= FSP_BIT_EN_MSID6;
@@ -776,6 +894,19 @@ static int fsp_activate_protocol(struct psmouse *psmouse)
 	/* Enable on-pad vertical and horizontal scrolling */
 	fsp_onpad_vscr(psmouse, true);
 	fsp_onpad_hscr(psmouse, true);
+
+	/* Enable absolute positioning, two finger mode and continuous output
+	 * on Cx and newer pads (version ID 0xE0+)
+	 */
+	if (pad->ver >= 0xE0) {
+		val = FSP_CX_ABSOLUTE_MODE |
+			FSP_CX_2FINGERS_OUTPUT |
+			FSP_CX_CONTINUOUS_MODE;
+		if (fsp_reg_write(psmouse, FSP_REG_SWREG1, val)) {
+			dev_warn(&psmouse->ps2dev.serio->dev,
+				 "Failed to enable multitouch settings.\n");
+		}
+	}
 
 	return 0;
 }
@@ -832,6 +963,7 @@ static int fsp_reconnect(struct psmouse *psmouse)
 
 int fsp_init(struct psmouse *psmouse)
 {
+	struct input_dev *dev = psmouse->dev;
 	struct fsp_data *priv;
 	int ver, rev, buttons;
 	int error;
@@ -858,11 +990,30 @@ int fsp_init(struct psmouse *psmouse)
 	priv->flags |= FSPDRV_FLAG_EN_OPC;
 
 	/* Set up various supported input event bits */
-	__set_bit(BTN_MIDDLE, psmouse->dev->keybit);
-	__set_bit(BTN_BACK, psmouse->dev->keybit);
-	__set_bit(BTN_FORWARD, psmouse->dev->keybit);
-	__set_bit(REL_WHEEL, psmouse->dev->relbit);
-	__set_bit(REL_HWHEEL, psmouse->dev->relbit);
+	__set_bit(BTN_MIDDLE, dev->keybit);
+	__set_bit(BTN_BACK, dev->keybit);
+	__set_bit(BTN_FORWARD, dev->keybit);
+	__set_bit(REL_WHEEL, dev->relbit);
+	__set_bit(REL_HWHEEL, dev->relbit);
+
+	/* Set up multitouch mode on Cx+ version hardware (reg value 0xE0+)
+	 * for example ASUS Zenbook UX21E has Sentelic touchpad version 0xE3
+	 */
+	if (ver >= 0xE0) {
+		int abs_x = 1024, abs_y = 768;
+
+		__set_bit(EV_ABS, dev->evbit);
+		__clear_bit(EV_REL, dev->evbit);
+		__set_bit(BTN_TOUCH, dev->keybit);
+		__set_bit(BTN_TOOL_FINGER, dev->keybit);
+		__set_bit(BTN_TOOL_DOUBLETAP, dev->keybit);
+
+		input_set_abs_params(dev, ABS_X, 0, abs_x, 0, 0);
+		input_set_abs_params(dev, ABS_Y, 0, abs_y, 0, 0);
+		input_mt_init_slots(dev, 2);
+		input_set_abs_params(dev, ABS_MT_POSITION_X, 0, abs_x, 0, 0);
+		input_set_abs_params(dev, ABS_MT_POSITION_Y, 0, abs_y, 0, 0);
+	}
 
 	psmouse->protocol_handler = fsp_process_byte;
 	psmouse->disconnect = fsp_disconnect;
