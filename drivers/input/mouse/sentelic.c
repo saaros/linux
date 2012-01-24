@@ -751,9 +751,8 @@ static psmouse_ret_t fsp_process_byte(struct psmouse *psmouse)
 		}
 
 		if ((packet[0] & BIT(4)) == 0 && lbutton) {
-			/* on pad click */
-			lbutton = (ad->flags & FSPDRV_FLAG_EN_OPC) ==
-						FSPDRV_FLAG_EN_OPC;
+			/* on pad click, let X/evdev handle this */
+			lbutton = false;
 		}
 
 		input_report_key(dev, BTN_TOUCH, fingers > 0);
